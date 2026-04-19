@@ -47,7 +47,7 @@ def build_processed_store(cfg) -> None:
     lr_longitude = None
 
     for year in years:
-        files = sorted(raw_dir.glob(f"*{year}*.nc"))
+        files = sorted(raw_dir.glob(f"**/*{year}*.nc"))
         if not files:
             raise FileNotFoundError(f"No GLORYS files found for year {year} in {raw_dir}")
 
