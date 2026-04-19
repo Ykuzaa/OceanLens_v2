@@ -10,6 +10,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from oceanlens_v2.data.datamodule import OceanLensDataModule
+from oceanlens_v2.training.ema import FlowMatchingEMACallback
 from oceanlens_v2.training.system import OceanLensV1System
 from oceanlens_v2.utils.config import load_config
 
@@ -43,6 +44,10 @@ def main() -> None:
         mode="min",
     )
     training_cfg = cfg.training[args.phase]
+    callbacks = [checkpoint, LearningRateMonitor(logging_interval="epoch")]
+    ema_cfg = getattr(training_cfg, "ema", None)
+    if args.phase == "fm" and ema_cfg is not None and bool(getattr(ema_cfg, "enabled", False)):
+        callbacks.append(FlowMatchingEMACallback(decay=float(ema_cfg.decay)))
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=[args.gpu],
@@ -50,7 +55,7 @@ def main() -> None:
         accumulate_grad_batches=int(training_cfg.accumulate_grad_batches),
         gradient_clip_val=float(training_cfg.gradient_clip_val),
         default_root_dir=str(run_dir),
-        callbacks=[checkpoint, LearningRateMonitor(logging_interval="epoch")],
+        callbacks=callbacks,
         log_every_n_steps=20,
     )
     trainer.fit(system, datamodule=datamodule)
@@ -58,4 +63,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

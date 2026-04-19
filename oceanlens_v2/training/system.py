@@ -11,6 +11,7 @@ from oceanlens_v2.losses.cno import masked_residual_cno_loss
 from oceanlens_v2.losses.fm import flow_matching_velocity_loss
 from oceanlens_v2.metrics.currents import current_summary_metrics
 from oceanlens_v2.metrics.pointwise import masked_correlation, masked_mae, masked_rmse
+from oceanlens_v2.metrics.probabilistic import masked_ensemble_crps, masked_spread_skill_ratio
 from oceanlens_v2.models.cno_resampling import filtered_resize_to_shape
 from oceanlens_v2.models.factory import build_cno_from_config, build_fm_from_config
 
@@ -75,10 +76,19 @@ class OceanLensV1System(pl.LightningModule):
             self.log("val/fm_loss", fm_loss, prog_bar=True, sync_dist=True)
 
         if batch_idx == 0:
-            prediction = mu if self.phase == "cno" else self.sample(lr, hr_mask, n_steps=int(self.cfg.inference.n_steps), ensemble_members=1)
+            if self.phase == "cno":
+                prediction = mu
+                ensemble = None
+            else:
+                validation_members = int(getattr(self.cfg.inference, "validation_ensemble_members", 1))
+                ensemble = self.sample_ensemble(lr, hr_mask, n_steps=int(self.cfg.inference.n_steps), ensemble_members=validation_members)
+                prediction = ensemble.mean(dim=0)
             self.log("val/sample_mae", masked_mae(prediction, hr, hr_mask), sync_dist=True)
             self.log("val/sample_rmse", masked_rmse(prediction, hr, hr_mask), sync_dist=True)
             self.log("val/sample_corr", masked_correlation(prediction, hr, hr_mask), sync_dist=True)
+            if ensemble is not None and ensemble.shape[0] > 1:
+                self.log("val/sample_crps", masked_ensemble_crps(ensemble, hr, hr_mask), sync_dist=True)
+                self.log("val/spread_skill_ratio", masked_spread_skill_ratio(ensemble, hr, hr_mask), sync_dist=True)
             variables = list(self.cfg.data.variables)
             current_metrics = current_summary_metrics(
                 prediction,
@@ -93,13 +103,18 @@ class OceanLensV1System(pl.LightningModule):
     @torch.no_grad()
     def sample(self, lr: torch.Tensor, hr_mask: torch.Tensor, n_steps: int, ensemble_members: int) -> torch.Tensor:
         """Generate HR prediction as ensemble mean over FM residual samples."""
+        return self.sample_ensemble(lr, hr_mask, n_steps=n_steps, ensemble_members=ensemble_members).mean(dim=0)
+
+    @torch.no_grad()
+    def sample_ensemble(self, lr: torch.Tensor, hr_mask: torch.Tensor, n_steps: int, ensemble_members: int) -> torch.Tensor:
+        """Generate HR predictions for each FM ensemble member."""
         hr_shape = hr_mask.shape[-2:]
         mu, _ = self.compute_mu(lr, hr_shape, hr_mask)
         predictions = []
         for _ in range(int(ensemble_members)):
             residual = self.integrate_fm_residual(mu, hr_mask, n_steps=n_steps)
             predictions.append((mu + residual) * hr_mask)
-        return torch.stack(predictions, dim=0).mean(dim=0)
+        return torch.stack(predictions, dim=0)
 
     @torch.no_grad()
     def integrate_fm_residual(self, mu: torch.Tensor, ocean_mask: torch.Tensor, n_steps: int) -> torch.Tensor:
@@ -117,7 +132,7 @@ class OceanLensV1System(pl.LightningModule):
             elif solver == "heun":
                 v1 = self.fm(x, t, mu)
                 t_next = torch.clamp(t + dt, max=1.0)
-                x_euler = x + dt * v1
+                x_euler = (x + dt * v1) * ocean_mask
                 v2 = self.fm(x_euler, t_next, mu)
                 x = x + 0.5 * dt * (v1 + v2)
             else:
@@ -166,8 +181,11 @@ class OceanLensV1System(pl.LightningModule):
 
     def load_fm_weights(self, checkpoint_path: str) -> None:
         state = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = state.get("state_dict", state)
-        fm_state = {key.replace("fm.", "", 1): value for key, value in state_dict.items() if key.startswith("fm.")}
+        if "fm_ema_state_dict" in state:
+            fm_state = state["fm_ema_state_dict"]
+        else:
+            state_dict = state.get("state_dict", state)
+            fm_state = {key.replace("fm.", "", 1): value for key, value in state_dict.items() if key.startswith("fm.")}
         missing, unexpected = self.fm.load_state_dict(fm_state, strict=False)
         if missing or unexpected:
             print(f"FM load: missing={missing}, unexpected={unexpected}")

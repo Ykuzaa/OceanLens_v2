@@ -56,6 +56,9 @@ training:
     weight_decay: 1.0e-4
     scheduler: cosine
     warmup_steps: 1000
+    ema:
+      enabled: false
+      decay: 0.999
     gradient_clip_val: 1.0
     accumulate_grad_batches: 16
   fm:
@@ -65,13 +68,17 @@ training:
     weight_decay: 1.0e-4
     scheduler: cosine
     warmup_steps: 1000
+    ema:
+      enabled: true
+      decay: 0.999
     gradient_clip_val: 1.0
     accumulate_grad_batches: 16
 
 inference:
   n_steps: 20
   solver: heun
-  ensemble_members: 1
+  ensemble_members: 4
+  validation_ensemble_members: 4
   tile_size: 128
   tile_overlap: 16
 
