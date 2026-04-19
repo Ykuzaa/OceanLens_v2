@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oceanlens-v2"
+version = "0.1.0"
+description = "Clean CNO + Flow Matching ocean downscaling pipeline"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "pytorch-lightning>=2.1",
+    "pyyaml>=6.0",
+    "numpy",
+    "scipy",
+    "xarray",
+    "zarr",
+    "netcdf4",
+    "matplotlib",
+    "tensorboard",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["oceanlens_v2*"]
+
