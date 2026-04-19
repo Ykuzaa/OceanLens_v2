@@ -54,6 +54,8 @@ training:
     max_epochs: 150
     learning_rate: 3.0e-4
     weight_decay: 1.0e-4
+    scheduler: cosine
+    warmup_steps: 1000
     gradient_clip_val: 1.0
     accumulate_grad_batches: 16
   fm:
@@ -61,12 +63,14 @@ training:
     max_epochs: 200
     learning_rate: 5.0e-4
     weight_decay: 1.0e-4
+    scheduler: cosine
+    warmup_steps: 1000
     gradient_clip_val: 1.0
     accumulate_grad_batches: 16
 
 inference:
   n_steps: 20
-  solver: euler
+  solver: heun
   ensemble_members: 1
   tile_size: 128
   tile_overlap: 16
@@ -74,4 +78,3 @@ inference:
 paths:
   run_dir: runs/v1
   result_dir: results/v1
-

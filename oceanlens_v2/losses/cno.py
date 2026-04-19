@@ -22,7 +22,6 @@ def masked_residual_cno_loss(
     for channel in range(predicted_residual.shape[1]):
         channel_error = (predicted_residual[:, channel] - target_residual[:, channel]).abs() * ocean_mask[:, 0]
         loss = loss + weights[channel] * channel_error.sum() / denom
-    loss = loss / weights.sum().clamp(min=1.0)
 
     grad_cfg = cfg.loss.cno.log_temperature_gradient
     if bool(grad_cfg.enabled) and float(grad_cfg.weight) > 0.0:
@@ -38,4 +37,3 @@ def masked_residual_cno_loss(
         )
         loss = loss + float(grad_cfg.weight) * grad_loss
     return loss
-

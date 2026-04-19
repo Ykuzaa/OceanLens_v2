@@ -17,6 +17,8 @@ def flow_matching_velocity_loss(
     t = torch.rand(batch_size, device=target_residual.device)
     t_view = t.view(batch_size, 1, 1, 1)
     x0 = torch.randn_like(target_residual)
+    if mask_ocean:
+        x0 = x0 * ocean_mask
     x_t = (1.0 - t_view) * x0 + t_view * target_residual
     target_velocity = target_residual - x0
     predicted_velocity = fm_model(x_t, t, mu_condition)
@@ -25,4 +27,3 @@ def flow_matching_velocity_loss(
         loss = loss * ocean_mask
         return loss.sum() / (ocean_mask.sum().clamp(min=1.0) * target_residual.shape[1])
     return loss.mean()
-

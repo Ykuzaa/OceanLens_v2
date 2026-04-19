@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import pytorch_lightning as pl
 
@@ -95,14 +97,14 @@ class OceanLensV1System(pl.LightningModule):
         mu, _ = self.compute_mu(lr, hr_shape, hr_mask)
         predictions = []
         for _ in range(int(ensemble_members)):
-            residual = self.integrate_fm_residual(mu, n_steps=n_steps)
+            residual = self.integrate_fm_residual(mu, hr_mask, n_steps=n_steps)
             predictions.append((mu + residual) * hr_mask)
         return torch.stack(predictions, dim=0).mean(dim=0)
 
     @torch.no_grad()
-    def integrate_fm_residual(self, mu: torch.Tensor, n_steps: int) -> torch.Tensor:
+    def integrate_fm_residual(self, mu: torch.Tensor, ocean_mask: torch.Tensor, n_steps: int) -> torch.Tensor:
         """Integrate the FM velocity field from Gaussian noise to residual."""
-        x = torch.randn_like(mu)
+        x = torch.randn_like(mu) * ocean_mask
         dt = 1.0 / float(n_steps)
         solver = str(self.cfg.inference.solver)
         for step in range(n_steps):
@@ -112,18 +114,47 @@ class OceanLensV1System(pl.LightningModule):
                 t_mid = torch.clamp(t + 0.5 * dt, max=1.0)
                 v2 = self.fm(x + 0.5 * dt * v1, t_mid, mu)
                 x = x + dt * v2
+            elif solver == "heun":
+                v1 = self.fm(x, t, mu)
+                t_next = torch.clamp(t + dt, max=1.0)
+                x_euler = x + dt * v1
+                v2 = self.fm(x_euler, t_next, mu)
+                x = x + 0.5 * dt * (v1 + v2)
             else:
                 x = x + dt * self.fm(x, t, mu)
+            x = x * ocean_mask
         return x
 
     def configure_optimizers(self):
         training_cfg = self.cfg.training[self.phase]
         parameters = self.cno.parameters() if self.phase == "cno" else self.fm.parameters()
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             parameters,
             lr=float(training_cfg.learning_rate),
             weight_decay=float(training_cfg.weight_decay),
         )
+        if str(getattr(training_cfg, "scheduler", "none")) != "cosine":
+            return optimizer
+
+        warmup_steps = int(getattr(training_cfg, "warmup_steps", 0))
+        total_steps = max(warmup_steps + 1, int(getattr(self.trainer, "estimated_stepping_batches", 0) or 0))
+
+        def lr_lambda(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return float(step + 1) / float(warmup_steps)
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            progress = min(1.0, max(0.0, progress))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     def load_cno_weights(self, checkpoint_path: str) -> None:
         state = torch.load(checkpoint_path, map_location="cpu")
