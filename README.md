@@ -123,6 +123,36 @@ The script writes files as:
 /scratch/emboulaalam/data/glorys/raw_daily/YYYY/glorys_YYYY-MM-DD.nc
 ```
 
+On LIR, the wiki says Internet is available from the frontal node, while regular
+compute nodes generally cannot access Internet. For Copernicus Marine downloads,
+run the download from the frontal with `nohup`, `tmux`, or `screen`; do not use a
+normal `sbatch` CPU job unless network access has been explicitly opened for it.
+
+For a global download on LIR that continues after disconnecting:
+
+```bash
+cd /scratch/emboulaalam/OceanLens_v2
+conda activate oceanlens
+mkdir -p logs
+nohup bash scripts/download_glorys_global.sh > logs/download_glorys_global.out 2>&1 &
+echo $! > logs/download_glorys_global.pid
+```
+
+Monitor it:
+
+```bash
+tail -f logs/download_glorys_global.out
+```
+
+Stop it if needed:
+
+```bash
+kill "$(cat logs/download_glorys_global.pid)"
+```
+
+The script is resumable at file level: if a daily NetCDF already exists, it is
+skipped.
+
 ### 4. Preprocess to Zarr
 
 ```bash
