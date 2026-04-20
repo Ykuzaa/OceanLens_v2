@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+import xarray as xr
 
 from oceanlens_v2.data.dataset import PreprocessedOceanDataset
 from oceanlens_v2.training.system import OceanLensV1System
@@ -33,6 +34,32 @@ def gaussian_tile_weight(height: int, width: int, device: torch.device, dtype: t
     yy, xx = torch.meshgrid(y, x, indexing="ij")
     weight = torch.exp(-2.0 * (xx.square() + yy.square()))
     return weight.clamp(min=1.0e-3).view(1, 1, height, width)
+
+
+def denormalize_tensor_per_pixel(values: torch.Tensor, mean_map: torch.Tensor, std_map: torch.Tensor) -> torch.Tensor:
+    """Reverse per-pixel normalization for tensors with channel/y/x trailing axes."""
+    if values.ndim == 5:
+        return values * std_map[None, None, :, :, :] + mean_map[None, None, :, :, :]
+    if values.ndim == 4:
+        return values * std_map[None, :, :, :] + mean_map[None, :, :, :]
+    if values.ndim == 3:
+        return values * std_map + mean_map
+    raise ValueError(f"Expected ndim 3, 4 or 5, got {values.ndim}")
+
+
+def load_normalization_maps(processed_store: str, device: torch.device) -> dict[str, torch.Tensor] | None:
+    """Load per-pixel normalization maps from the processed Zarr store."""
+    store = xr.open_zarr(processed_store)
+    try:
+        required = ["hr_mean_map", "hr_std_map", "lr_mean_map", "lr_std_map"]
+        if not all(name in store for name in required):
+            return None
+        return {
+            name: torch.from_numpy(store[name].values.astype(np.float32)).to(device)
+            for name in required
+        }
+    finally:
+        store.close()
 
 
 @torch.no_grad()
@@ -105,6 +132,10 @@ def main() -> None:
     system.load_cno_weights(args.cno_ckpt)
     system.load_fm_weights(args.fm_ckpt)
     system.eval().to(args.device)
+    device = torch.device(args.device)
+    normalization_maps = load_normalization_maps(cfg.data.processed_store, device)
+    if normalization_maps is None:
+        print("[infer] normalization maps not found; saving normalized arrays", flush=True)
 
     ensemble_members = args.ensemble_members or int(cfg.inference.ensemble_members)
     with torch.no_grad():
@@ -125,9 +156,21 @@ def main() -> None:
                 int(cfg.inference.tile_overlap),
             )
             pred = ensemble.mean(dim=0)
+            lr_on_hr_grid = system.prepare_lr_on_hr_grid(lr, hr.shape[-2:])
+            if normalization_maps is not None:
+                hr_mean_map = normalization_maps["hr_mean_map"]
+                hr_std_map = normalization_maps["hr_std_map"]
+                lr_mean_map = normalization_maps["lr_mean_map"]
+                lr_std_map = normalization_maps["lr_std_map"]
+                lr_physical = denormalize_tensor_per_pixel(lr, lr_mean_map, lr_std_map)
+                lr_on_hr_grid = system.prepare_lr_on_hr_grid(lr_physical, hr.shape[-2:])
+                mu = denormalize_tensor_per_pixel(mu, hr_mean_map, hr_std_map)
+                pred = denormalize_tensor_per_pixel(pred, hr_mean_map, hr_std_map)
+                ensemble = denormalize_tensor_per_pixel(ensemble, hr_mean_map, hr_std_map)
+                hr = denormalize_tensor_per_pixel(hr, hr_mean_map, hr_std_map)
             np.savez_compressed(
                 output_dir / f"sample_{sample_id:04d}.npz",
-                lr=system.prepare_lr_on_hr_grid(lr, hr.shape[-2:]).cpu().numpy(),
+                lr=lr_on_hr_grid.cpu().numpy(),
                 mu=mu.cpu().numpy(),
                 pred=pred.cpu().numpy(),
                 ensemble=ensemble.cpu().numpy(),

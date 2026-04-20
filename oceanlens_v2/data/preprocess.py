@@ -9,7 +9,7 @@ import numpy as np
 import xarray as xr
 
 from oceanlens_v2.data.coarsen import coarsen_to_target_resolution, interpolate_to_reference_grid
-from oceanlens_v2.data.stats import normalize_channels, replace_nan_with_channel_mean
+from oceanlens_v2.data.stats import PerPixelWelford, normalize_per_pixel, replace_nan_with_pixel_mean
 
 
 def _load_daily_glorys_file(path: Path, variables: list[str]) -> xr.Dataset:
@@ -56,10 +56,15 @@ def _build_lr_dataset(hr_dataset: xr.Dataset, cfg) -> xr.Dataset:
         experimental_grid.close()
 
 
-def _compute_streaming_train_stats(raw_dir: Path, train_years: list[int], variables: list[str]) -> tuple[np.ndarray, np.ndarray]:
-    sums = np.zeros(len(variables), dtype=np.float64)
-    sumsq = np.zeros(len(variables), dtype=np.float64)
-    counts = np.zeros(len(variables), dtype=np.int64)
+def _compute_perpixel_train_stats(
+    raw_dir: Path,
+    train_years: list[int],
+    variables: list[str],
+    cfg,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute per-pixel mean/std maps for HR and LR grids, streaming."""
+    hr_welford: PerPixelWelford | None = None
+    lr_welford: PerPixelWelford | None = None
 
     for year in train_years:
         files = _year_files(raw_dir, year)
@@ -68,28 +73,41 @@ def _compute_streaming_train_stats(raw_dir: Path, train_years: list[int], variab
             print(f"[stats] {year} {index}/{len(files)} {path.name}", flush=True)
             hr_dataset = _load_daily_glorys_file(path, variables)
             try:
-                hr = _dataset_to_channel_array(hr_dataset, variables)
-                hr_mask = np.all(~np.isnan(hr), axis=1)
-                for channel in range(hr.shape[1]):
-                    values = hr[:, channel][hr_mask]
-                    valid = values[~np.isnan(values)].astype(np.float64, copy=False)
-                    sums[channel] += valid.sum()
-                    sumsq[channel] += np.square(valid).sum()
-                    counts[channel] += valid.size
+                lr_dataset = _build_lr_dataset(hr_dataset, cfg)
+                try:
+                    hr = _dataset_to_channel_array(hr_dataset, variables)
+                    lr = _dataset_to_channel_array(lr_dataset, variables)
+
+                    if hr_welford is None:
+                        hr_welford = PerPixelWelford(hr.shape[1:])
+                    if lr_welford is None:
+                        lr_welford = PerPixelWelford(lr.shape[1:])
+
+                    for t in range(hr.shape[0]):
+                        hr_frame = hr[t]
+                        lr_frame = lr[t]
+                        hr_mask = np.all(~np.isnan(hr_frame), axis=0).astype(np.float32)
+                        lr_mask = np.all(~np.isnan(lr_frame), axis=0).astype(np.float32)
+                        hr_welford.update(hr_frame, hr_mask)
+                        lr_welford.update(lr_frame, lr_mask)
+                finally:
+                    lr_dataset.close()
             finally:
                 hr_dataset.close()
 
-    if np.any(counts == 0):
-        raise ValueError(f"Cannot compute normalization stats; empty channels: {np.flatnonzero(counts == 0).tolist()}")
+    if hr_welford is None or lr_welford is None:
+        raise ValueError("Cannot compute normalization stats; no training samples were found")
 
-    means = sums / counts
-    variances = np.maximum(sumsq / counts - np.square(means), 0.0)
-    stds = np.sqrt(variances) + 1.0e-8
-    return means.astype(np.float32), stds.astype(np.float32)
+    hr_mean, hr_std, _ = hr_welford.finalize()
+    lr_mean, lr_std, _ = lr_welford.finalize()
+    return hr_mean, hr_std, lr_mean, lr_std
 
 
-def _normalize_sample(values: np.ndarray, mask: np.ndarray, means: np.ndarray, stds: np.ndarray) -> np.ndarray:
-    return normalize_channels(replace_nan_with_channel_mean(values, means), means, stds) * mask[:, None]
+def _normalize_sample_perpixel(values: np.ndarray, mask: np.ndarray, mean_map: np.ndarray, std_map: np.ndarray) -> np.ndarray:
+    """Normalize with per-pixel maps; land pixels are zeroed by mask multiplication."""
+    filled = replace_nan_with_pixel_mean(values, mean_map)
+    normalized = normalize_per_pixel(filled, mean_map, std_map)
+    return normalized * mask[:, None]
 
 
 def _output_dataset(
@@ -104,8 +122,10 @@ def _output_dataset(
     hr_longitude: np.ndarray,
     lr_latitude: np.ndarray,
     lr_longitude: np.ndarray,
-    means: np.ndarray | None = None,
-    stds: np.ndarray | None = None,
+    hr_mean_map: np.ndarray | None = None,
+    hr_std_map: np.ndarray | None = None,
+    lr_mean_map: np.ndarray | None = None,
+    lr_std_map: np.ndarray | None = None,
 ) -> xr.Dataset:
     data_vars = {
         "hr": (("time", "channel", "y_hr", "x_hr"), hr),
@@ -114,9 +134,13 @@ def _output_dataset(
         "lr_mask": (("time", "y_lr", "x_lr"), lr_mask),
         "year": (("time",), years),
     }
-    if means is not None and stds is not None:
-        data_vars["mean"] = (("channel",), means)
-        data_vars["std"] = (("channel",), stds)
+    if hr_mean_map is not None:
+        if hr_std_map is None or lr_mean_map is None or lr_std_map is None:
+            raise ValueError("All per-pixel normalization maps must be provided together")
+        data_vars["hr_mean_map"] = (("channel", "y_hr", "x_hr"), hr_mean_map)
+        data_vars["hr_std_map"] = (("channel", "y_hr", "x_hr"), hr_std_map)
+        data_vars["lr_mean_map"] = (("channel", "y_lr", "x_lr"), lr_mean_map)
+        data_vars["lr_std_map"] = (("channel", "y_lr", "x_lr"), lr_std_map)
 
     return xr.Dataset(
         data_vars,
@@ -136,6 +160,12 @@ def _zarr_encoding(dataset: xr.Dataset) -> dict[str, dict[str, tuple[int, ...]]]
     for name, data_array in dataset.data_vars.items():
         if "time" in data_array.dims:
             encoding[name] = {"chunks": tuple(1 if dim == "time" else size for dim, size in data_array.sizes.items())}
+        elif name.endswith("_map"):
+            encoding[name] = {
+                "chunks": tuple(
+                    min(512, size) if dim.startswith(("y_", "x_")) else size for dim, size in data_array.sizes.items()
+                )
+            }
     return encoding
 
 
@@ -155,9 +185,16 @@ def build_processed_store(cfg) -> None:
     print(f"[preprocess] output_store={output_store}", flush=True)
     print(f"[preprocess] years={years}", flush=True)
 
-    means, stds = _compute_streaming_train_stats(raw_dir, list(cfg.data.train_years), variables)
-    print(f"[preprocess] means={means.tolist()}", flush=True)
-    print(f"[preprocess] stds={stds.tolist()}", flush=True)
+    hr_mean_map, hr_std_map, lr_mean_map, lr_std_map = _compute_perpixel_train_stats(
+        raw_dir,
+        list(cfg.data.train_years),
+        variables,
+        cfg,
+    )
+    print(f"[preprocess] hr_mean_map shape={hr_mean_map.shape}", flush=True)
+    print(f"[preprocess] hr_std_map min={float(hr_std_map.min())} max={float(hr_std_map.max())}", flush=True)
+    print(f"[preprocess] lr_mean_map shape={lr_mean_map.shape}", flush=True)
+    print(f"[preprocess] lr_std_map min={float(lr_std_map.min())} max={float(lr_std_map.max())}", flush=True)
 
     if output_store.exists():
         print(f"[preprocess] removing existing store: {output_store}", flush=True)
@@ -192,8 +229,8 @@ def build_processed_store(cfg) -> None:
                     lr = _dataset_to_channel_array(lr_dataset, variables)
                     hr_mask = np.all(~np.isnan(hr), axis=1).astype(np.float32)
                     lr_mask = np.all(~np.isnan(lr), axis=1).astype(np.float32)
-                    hr = _normalize_sample(hr, hr_mask, means, stds)
-                    lr = _normalize_sample(lr, lr_mask, means, stds)
+                    hr = _normalize_sample_perpixel(hr, hr_mask, hr_mean_map, hr_std_map)
+                    lr = _normalize_sample_perpixel(lr, lr_mask, lr_mean_map, lr_std_map)
                     times = hr_dataset.time.values
                     years_by_sample = np.full(hr_dataset.sizes["time"], year, dtype=np.int16)
 
@@ -209,8 +246,10 @@ def build_processed_store(cfg) -> None:
                         hr_longitude,
                         lr_latitude,
                         lr_longitude,
-                        means if not wrote_first else None,
-                        stds if not wrote_first else None,
+                        hr_mean_map if not wrote_first else None,
+                        hr_std_map if not wrote_first else None,
+                        lr_mean_map if not wrote_first else None,
+                        lr_std_map if not wrote_first else None,
                     )
                     if wrote_first:
                         output.to_zarr(output_store, mode="a", append_dim="time")

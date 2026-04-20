@@ -24,10 +24,13 @@ def main() -> None:
     print("LR mask ocean fraction:", float(dataset["lr_mask"].mean()))
     print("Variables:", list(dataset["channel"].values))
     print("Years:", sorted(set(dataset["year"].values.tolist())))
-    print("Mean:", dataset["mean"].values)
-    print("Std:", dataset["std"].values)
+    print("HR mean_map shape:", dataset["hr_mean_map"].shape)
+    print("HR mean_map: min", float(dataset["hr_mean_map"].min()), "max", float(dataset["hr_mean_map"].max()))
+    print("HR std_map: min", float(dataset["hr_std_map"].min()), "max", float(dataset["hr_std_map"].max()))
+    print("LR mean_map shape:", dataset["lr_mean_map"].shape)
+    print("LR mean_map: min", float(dataset["lr_mean_map"].min()), "max", float(dataset["lr_mean_map"].max()))
+    print("LR std_map: min", float(dataset["lr_std_map"].min()), "max", float(dataset["lr_std_map"].max()))
 
 
 if __name__ == "__main__":
     main()
-
