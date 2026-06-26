@@ -1,217 +1,135 @@
-# OceanLens_v2
+# OceanLens
 
-Clean restart of OceanLens.
+AI-based ocean forecast super-resolution with **Convolutional Neural Operators** and **Flow Matching**.
 
-`v1` is the full architecture from the beginning:
+OceanLens is a research-oriented deep learning pipeline for turning coarse ocean forecasts into higher-resolution ocean surface fields. It combines a deterministic neural-operator correction with a probabilistic generative residual model.
+
+## Why It Matters
+
+Operational ocean forecasts are expensive to run at high resolution. A learned super-resolution system can help recover fine-scale structures such as fronts, currents and eddies from coarser forecasts, while keeping inference cheaper and easier to deploy.
+
+## Method
 
 ```text
-LR -> residual CNO -> mu -> Flow Matching residual -> HR prediction
+Low-resolution forecast
+        |
+        v
+Convolutional Neural Operator residual
+        |
+        v
+Deterministic corrected field mu
+        |
+        v
+Flow Matching stochastic residual
+        |
+        v
+High-resolution forecast sample
 ```
 
-with
+Core equation:
 
 ```text
 mu = LR + CNO(LR)
 HR_hat = mu + FM(z, mu)
 ```
 
-The goal is to avoid the prototype issues from `OceanLens_git`:
+## What This Repository Demonstrates
 
-- no NetCDF opening inside every training batch;
-- no ambiguous nearest/bilinear training input;
-- clean land/NaN handling before normalization;
-- CNO resampling isolated in explicit code;
-- metrics available from day one;
-- `ensemble_members` supported in inference.
+- CNO-based deterministic downscaling for ocean variables
+- Flow Matching for stochastic residual generation
+- preprocessing from Copernicus Marine / GLORYS NetCDF files to Zarr tensors
+- land/NaN handling and normalization for geophysical grids
+- reproducible training and inference scripts
+- SLURM/HPC launchers for GPU training
+- metrics for pointwise error, currents, spectra, fronts and probabilistic outputs
 
-## Data Pipeline
-
-The preprocessing stage creates ready-to-train tensors:
+## Repository Layout
 
 ```text
-GLORYS HR 1/12 daily
+OceanLens_v2/
+├── oceanlens_v2/          # Python package
+│   ├── data/              # dataset, datamodule, preprocessing helpers
+│   ├── losses/            # CNO and Flow Matching losses
+│   ├── metrics/           # pointwise, spectra, fronts, currents, probabilistic metrics
+│   ├── models/            # CNO, FM U-Net, model factory
+│   ├── training/          # PyTorch Lightning system
+│   └── utils/
+├── scripts/               # download, preprocess, train, infer, evaluate
+├── configs/               # experiment configuration
+├── slurm/                 # HPC launchers
+├── docs/                  # data, HPC and results notes
+└── pyproject.toml
+```
+
+## Quickstart
+
+Install locally:
+
+```bash
+git clone https://github.com/Ykuzaa/OceanLens_v2.git
+cd OceanLens_v2
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+```
+
+Train the deterministic branch:
+
+```bash
+python scripts/train.py --config configs/v1.yaml --phase cno
+```
+
+Train the Flow Matching branch:
+
+```bash
+python scripts/train.py   --config configs/v1.yaml   --phase fm   --cno_ckpt runs/v1/cno/checkpoints/last.ckpt
+```
+
+Run inference:
+
+```bash
+python scripts/infer.py   --config configs/v1.yaml   --cno_ckpt runs/v1/cno/checkpoints/last.ckpt   --fm_ckpt runs/v1/fm/checkpoints/last.ckpt   --ensemble_members 5   --output_dir results/v1_ens5
+```
+
+## Data
+
+The pipeline was designed around Copernicus Marine GLORYS daily reanalysis fields. The preprocessing stage creates ready-to-train tensors:
+
+```text
+GLORYS HR 1/12 degree daily
   -> coarsen to 1.5 degree
   -> interpolate to 1/4 degree experimental LR
   -> save HR, LR, masks and stats to Zarr
 ```
 
-The `1/4` LR tensor is an experimental LR representation: it contains information degraded to `1.5 deg`, represented on a `1/4 deg` grid.
+See [docs/data.md](docs/data.md) for more details.
 
-## v1 Model
+## Evaluation
 
-- CNO branch learns a deterministic residual:
+OceanLens is evaluated with:
 
-```text
-delta = HR - LR
-mu = LR + delta
-```
+- RMSE / MAE by variable
+- current-speed diagnostics
+- kinetic-energy spectra
+- temperature-front diagnostics using log-gradient losses
+- ensemble/probabilistic metrics
 
-- Flow Matching branch learns the remaining stochastic residual:
+See [docs/results.md](docs/results.md) for the intended reporting structure.
 
-```text
-r = HR - mu
-```
+## HPC Notes
 
-- FM is conditioned on `mu`.
-- Temperature-front loss is available through:
+SLURM launchers are included for GPU training and evaluation. Cluster-specific commands and Copernicus download notes are documented separately in [docs/hpc.md](docs/hpc.md).
 
-```text
-log(|grad(thetao)| + eps)
-```
+## Skills Demonstrated
 
-## Typical Commands
+PyTorch, PyTorch Lightning, neural operators, Flow Matching, scientific machine learning, NetCDF, Zarr, xarray, geophysical data preprocessing, GPU training, SLURM, reproducible ML workflows.
 
-### 1. Pull the latest code on LIR/HPC
+## References
 
-```bash
-ssh <your_login>@<lir_hpc>
-cd /scratch/emboulaalam/OceanLens_v2
-git pull --ff-only origin main
-```
+- Raonic et al., 2023 - Convolutional Neural Operators
+- Lipman et al., 2023 - Flow Matching
+- Copernicus Marine Service - GLORYS ocean reanalysis
 
-### 2. Install and login to Copernicus Marine
+## Status
 
-Run this once in the environment used on the cluster:
-
-```bash
-conda activate oceanlens
-python -m pip install --upgrade copernicusmarine
-copernicusmarine --version
-copernicusmarine login
-```
-
-### 3. Download GLORYS daily files
-
-The default dataset is the Copernicus Marine GLORYS12V1 daily reanalysis:
-
-```text
-cmems_mod_glo_phy_my_0.083deg_P1D-m
-```
-
-Set the longitude/latitude box before running the commands. The values below
-are placeholders for a North Atlantic-like domain; adapt them to the scientific
-domain before launching a long download.
-
-Download train/validation years:
-
-```bash
-cd /scratch/emboulaalam/OceanLens_v2
-conda activate oceanlens
-
-OUT_DIR=/scratch/emboulaalam/data/glorys/raw_daily \
-START_DATE=1994-01-01 \
-END_DATE=2004-12-31 \
-LON_MIN=-20 LON_MAX=20 \
-LAT_MIN=30 LAT_MAX=60 \
-bash scripts/download_glorys_daily.sh
-```
-
-Download the test year:
-
-```bash
-OUT_DIR=/scratch/emboulaalam/data/glorys/raw_daily \
-START_DATE=2019-01-01 \
-END_DATE=2019-12-31 \
-LON_MIN=-20 LON_MAX=20 \
-LAT_MIN=30 LAT_MAX=60 \
-bash scripts/download_glorys_daily.sh
-```
-
-The script writes files as:
-
-```text
-/scratch/emboulaalam/data/glorys/raw_daily/YYYY/glorys_YYYY-MM-DD.nc
-```
-
-On LIR, the wiki says Internet is available from the frontal node, while regular
-compute nodes generally cannot access Internet. For Copernicus Marine downloads,
-run the download from the frontal with `nohup`, `tmux`, or `screen`; do not use a
-normal `sbatch` CPU job unless network access has been explicitly opened for it.
-
-For a global download on LIR that continues after disconnecting:
-
-```bash
-cd /scratch/emboulaalam/OceanLens_v2
-conda activate oceanlens
-mkdir -p logs
-nohup bash scripts/download_glorys_global.sh > logs/download_glorys_global.out 2>&1 &
-echo $! > logs/download_glorys_global.pid
-```
-
-Monitor it:
-
-```bash
-tail -f logs/download_glorys_global.out
-```
-
-Stop it if needed:
-
-```bash
-kill "$(cat logs/download_glorys_global.pid)"
-```
-
-The script is resumable at file level: if a daily NetCDF already exists, it is
-skipped.
-
-### 4. Preprocess to Zarr
-
-```bash
-cd /scratch/emboulaalam/OceanLens_v2
-conda activate oceanlens
-python scripts/preprocess_glorys.py --config configs/v1.yaml
-```
-
-Or submit the existing SLURM job:
-
-```bash
-sbatch slurm/preprocess.sbatch
-```
-
-### 5. Train CNO
-
-```bash
-cd /scratch/emboulaalam/OceanLens_v2
-conda activate oceanlens
-python scripts/train.py --config configs/v1.yaml --phase cno
-```
-
-Or with SLURM:
-
-```bash
-sbatch slurm/train_v1_cno.sbatch
-```
-
-### 6. Train FM
-
-```bash
-cd /scratch/emboulaalam/OceanLens_v2
-conda activate oceanlens
-python scripts/train.py --config configs/v1.yaml --phase fm --cno_ckpt runs/v1/cno/checkpoints/last.ckpt
-```
-
-Or with SLURM:
-
-```bash
-sbatch slurm/train_v1_fm.sbatch
-```
-
-### 7. Inference
-
-```bash
-cd /scratch/emboulaalam/OceanLens_v2
-conda activate oceanlens
-python scripts/infer.py \
-  --config configs/v1.yaml \
-  --cno_ckpt runs/v1/cno/checkpoints/last.ckpt \
-  --fm_ckpt runs/v1/fm/checkpoints/last.ckpt \
-  --ensemble_members 5 \
-  --output_dir results/v1_ens5
-```
-
-### 8. Evaluate
-
-```bash
-cd /scratch/emboulaalam/OceanLens_v2
-conda activate oceanlens
-python scripts/evaluate.py --result_dir results/v1_ens5
-```
+Research / apprenticeship project. Some datasets and trained checkpoints are not committed to this repository.
